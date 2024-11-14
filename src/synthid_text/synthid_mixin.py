@@ -398,14 +398,12 @@ class SynthIDGPT2LMHeadModel(
 ):
   pass
 
-class SynthIDOLMOForCausalLM(
-    SynthIDSparseTopKMixin, transformers.AutoModelForCausalLM
+class SynthIDGemmaForCausalLM(
+    SynthIDSparseTopKMixin, transformers.GemmaForCausalLM
 ):
   pass
 
-
-
-class SynthIDGemmaForCausalLM(
-    SynthIDSparseTopKMixin, transformers.GemmaForCausalLM
+class SynthIDAutoModelForCausalLM(
+    SynthIDSparseTopKMixin, transformers.AutoModelForCausalLM
 ):
   pass
