@@ -22,6 +22,8 @@ import immutabledict
 import torch
 import transformers
 
+from hf_olmo import OLMoForCausalLM
+
 from src.synthid_text import logits_processing
 
 
@@ -398,12 +400,18 @@ class SynthIDGPT2LMHeadModel(
 ):
   pass
 
-class SynthIDGemmaForCausalLM(
-    SynthIDSparseTopKMixin, transformers.GemmaForCausalLM
+class SynthIDOlmoForCausalLM(
+    SynthIDSparseTopKMixin, OLMoForCausalLM
 ):
   pass
 
 class SynthIDAutoModelForCausalLM(
     SynthIDSparseTopKMixin, transformers.AutoModelForCausalLM
+):
+  pass
+
+
+class SynthIDGemmaForCausalLM(
+    SynthIDSparseTopKMixin, transformers.GemmaForCausalLM
 ):
   pass
