@@ -7,3 +7,6 @@ immutabledict
 datasets
 jupyter
 accelerate
+jax
+jaxtyping
+flax
