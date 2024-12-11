@@ -7,3 +7,4 @@ immutabledict
 datasets
 jupyter
 accelerate
+scikit-learn

@@ -16,13 +16,13 @@
 """Code for Mean and Weighted Mean scoring functions."""
 
 from typing import Optional
-import jax.numpy as jnp
+import torch
 
 
 def mean_score(
-    g_values: jnp.ndarray,
-    mask: jnp.ndarray,
-) -> jnp.ndarray:
+    g_values: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
   """Computes the Mean score.
 
   Args:
@@ -35,17 +35,19 @@ def mean_score(
       g-values.
   """
   watermarking_depth = g_values.shape[-1]
-  num_unmasked = jnp.sum(mask, axis=1)  # shape [batch_size]
-  return jnp.sum(g_values * jnp.expand_dims(mask, 2), axis=(1, 2)) / (
-      watermarking_depth * num_unmasked
+  num_unmasked = mask.sum(dim=1)  # shape [batch_size]
+  return (
+          (g_values * mask.unsqueeze(2)).sum(dim=(1, 2)) /
+          (watermarking_depth * num_unmasked)
   )
 
 
+
 def weighted_mean_score(
-    g_values: jnp.ndarray,
-    mask: jnp.ndarray,
-    weights: Optional[jnp.ndarray] = None,
-) -> jnp.ndarray:
+    g_values: torch.Tensor,
+    mask: torch.Tensor,
+    weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
   """Computes the Weighted Mean score.
 
   Args:
@@ -63,15 +65,17 @@ def weighted_mean_score(
   watermarking_depth = g_values.shape[-1]
 
   if weights is None:
-    weights = jnp.linspace(start=10, stop=1, num=watermarking_depth)
+    weights = torch.linspace(start=10, end=1, steps=watermarking_depth)
 
   # Normalise weights so they sum to watermarking_depth.
-  weights *= watermarking_depth / jnp.sum(weights)
+  weights *= watermarking_depth / weights.sum()
 
   # Apply weights to g-values.
-  g_values *= jnp.expand_dims(weights, axis=(0, 1))
+  g_values *= weights.unsqueeze(0).unsqueeze(0)
 
-  num_unmasked = jnp.sum(mask, axis=1)  # shape [batch_size]
-  return jnp.sum(g_values * jnp.expand_dims(mask, 2), axis=(1, 2)) / (
-      watermarking_depth * num_unmasked
+  num_unmasked = mask.sum(dim=1)  # shape [batch_size]
+  return (
+          (g_values * mask.unsqueeze(2)).sum(dim=(1, 2)) /
+          (watermarking_depth * num_unmasked)
   )
+

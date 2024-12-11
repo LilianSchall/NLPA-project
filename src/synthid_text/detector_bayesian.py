@@ -21,12 +21,8 @@ import enum
 import functools
 import gc
 from typing import Any, Optional, Union
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
-from jaxtyping import PyTree  # pylint: disable=g-importing-member
+import torch.nn as nn
 import numpy as np
-import optax
 from sklearn import model_selection
 import torch
 import tqdm
@@ -210,7 +206,7 @@ class LikelihoodModel(abc.ABC):
   """Watermark likelihood model base class defining __call__ interface."""
 
   @abc.abstractmethod
-  def __call__(self, g_values: jnp.ndarray) -> jnp.ndarray:
+  def __call__(self, g_values: torch.Tensor) -> torch.Tensor:
     """Computes likelihoods given g-values and a mask.
 
     Args:
@@ -224,6 +220,7 @@ class LikelihoodModel(abc.ABC):
       the unwatermarked hypothesis; i.e. either P(g|watermarked)
       or P(g|unwatermarked).
     """
+    pass
 
 
 class LikelihoodModelWatermarked(nn.Module, LikelihoodModel):
@@ -232,38 +229,35 @@ class LikelihoodModelWatermarked(nn.Module, LikelihoodModel):
   This takes in g-values and returns P(g_values|watermarked).
   """
 
-  watermarking_depth: int
-  params: Optional[Mapping[str, Mapping[str, Any]]] = None
+  # watermarking_depth: int
+  # params: Optional[Mapping[str, Mapping[str, Any]]] = None
 
-  def setup(self):
+  def __init__(self, watermarking_depth: int, params: Optional[Mapping[str, Any]]):
     """Initializes the model parameters."""
+    super().__init__()
+    self.watermarking_depth = watermarking_depth
 
     def noise(seed, shape):
-      return jax.random.normal(key=jax.random.PRNGKey(seed), shape=shape)
+      torch.manual_seed(seed)
+      return torch.randn(shape)
 
-    self.beta = self.param(
-        "beta",
-        lambda *x: (
+    self.beta = nn.Parameter(
             -2.5 + 0.001 * noise(seed=0, shape=(1, 1, self.watermarking_depth))
-        ),
     )
-    self.delta = self.param(
-        "delta",
-        lambda *x: (
+    self.delta = nn.Parameter(
             0.001
             * noise(
                 seed=0,
                 shape=(1, 1, self.watermarking_depth, self.watermarking_depth),
             )
-        ),
     )
 
-  def l2_loss(self) -> jnp.ndarray:
-    return jnp.einsum("ijkl->", self.delta**2)
+  def l2_loss(self) -> torch.Tensor:
+    return torch.sum(self.delta ** 2)
 
   def _compute_latents(
-      self, g_values: jnp.ndarray
-  ) -> tuple[jnp.ndarray, jnp.ndarray]:
+      self, g_values: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     """Computes the unique token probability distribution given g-values.
 
     Args:
@@ -280,23 +274,23 @@ class LikelihoodModelWatermarked(nn.Module, LikelihoodModel):
     # Tile g-values to produce feature vectors for predicting the latents
     # for each layer in the tournament; our model for the latents psi is a
     # logistic regression model psi = sigmoid(delta * x + beta).
-    x = jnp.repeat(
-        jnp.expand_dims(g_values, axis=-2), self.watermarking_depth, axis=-2
+    x = g_values.unsqueeze(-2).repeat(
+        1, 1, self.watermarking_depth, 1
     )  # [batch_size, seq_len, watermarking_depth, watermarking_depth]
 
-    x = jnp.tril(
-        x, k=-1
+    x = torch.tril(
+        x, diagonal=-1
     )  # mask all elements above -1 diagonal for autoregressive factorization
 
     logits = (
-        jnp.einsum("ijkl,ijkl->ijk", self.delta, x) + self.beta
+        torch.einsum("ijkl,ijkl->ijk", self.delta, x) + self.beta
     )  # [batch_size, seq_len, watermarking_depth]
 
-    p_two_unique_tokens = jax.nn.sigmoid(logits)
+    p_two_unique_tokens = torch.sigmoid(logits)
     p_one_unique_token = 1 - p_two_unique_tokens
     return p_one_unique_token, p_two_unique_tokens
 
-  def __call__(self, g_values: jnp.ndarray) -> jnp.ndarray:
+  def forward(self, g_values: torch.Tensor) -> torch.Tensor:
     """Computes the likelihoods P(g_values|watermarked).
 
     Args:
@@ -320,8 +314,11 @@ class LikelihoodModelUnwatermarked(nn.Module, LikelihoodModel):
   This takes in g-values and returns p(g_values | not watermarked).
   """
 
-  @nn.compact
-  def __call__(self, g_values: jnp.ndarray) -> jnp.ndarray:
+  def __init__(self):
+    """Initializes the model parameters."""
+    super().__init__()
+
+  def forward(self, g_values: torch.Tensor) -> torch.Tensor:
     """Computes the likelihoods P(g-values|not watermarked).
 
     Args:
@@ -333,15 +330,15 @@ class LikelihoodModelUnwatermarked(nn.Module, LikelihoodModel):
       p(g_values | not watermarked) of shape [batch_size, seq_len,
       watermarking_depth].
     """
-    return 0.5 * jnp.ones_like(g_values)  # all g-values have prob 0.5.
+    return 0.5 * torch.ones_like(g_values)  # all g-values have prob 0.5.
 
 
 def _compute_posterior(
-    likelihoods_watermarked: jnp.ndarray,
-    likelihoods_unwatermarked: jnp.ndarray,
-    mask: jnp.ndarray,
+    likelihoods_watermarked: torch.Tensor,
+    likelihoods_unwatermarked: torch.Tensor,
+    mask: torch.Tensor,
     prior: float,
-) -> jnp.ndarray:
+) -> torch.Tensor:
   """Compute posterior P(w|g) given likelihoods, mask and prior.
 
   Args:
@@ -356,22 +353,22 @@ def _compute_posterior(
   Returns:
     Posterior probability P(watermarked|g_values), shape [batch].
   """
-  mask = jnp.expand_dims(mask, -1)
-  prior = jnp.clip(prior, a_min=1e-5, a_max=1 - 1e-5)
-  log_likelihoods_watermarked = jnp.log(
-      jnp.clip(likelihoods_watermarked, a_min=1e-30, a_max=float("inf"))
+  mask = mask.unsqueeze(-1)
+  prior = torch.clamp(torch.tensor(prior), min=1e-5, max=1 - 1e-5)
+  log_likelihoods_watermarked = torch.log(
+      torch.clamp(likelihoods_watermarked, min=1e-30)
   )
-  log_likelihoods_unwatermarked = jnp.log(
-      jnp.clip(likelihoods_unwatermarked, a_min=1e-30, a_max=float("inf"))
+  log_likelihoods_unwatermarked = torch.log(
+      torch.clamp(likelihoods_unwatermarked, min=1e-30)
   )
   log_odds = log_likelihoods_watermarked - log_likelihoods_unwatermarked
 
   # Sum relative surprisals (log odds) across all token positions and layers.
-  relative_surprisal_likelihood = jnp.einsum(
+  relative_surprisal_likelihood = torch.einsum(
       "i...->i", log_odds * mask
   )  # [batch_size].
 
-  relative_surprisal_prior = jnp.log(prior) - jnp.log(1 - prior)
+  relative_surprisal_prior = torch.log(prior) - torch.log(1 - prior)
 
   # Combine prior and likelihood.
   relative_surprisal = (
@@ -379,7 +376,7 @@ def _compute_posterior(
   )  # [batch_size]
 
   # Compute the posterior probability P(w|g) = sigmoid(relative_surprisal).
-  return jax.nn.sigmoid(relative_surprisal)
+  return torch.sigmoid(relative_surprisal)
 
 
 class BayesianDetectorModule(nn.Module):
@@ -393,19 +390,16 @@ class BayesianDetectorModule(nn.Module):
   the Bernoulli(0.5) g-value distribution.
   """
 
-  watermarking_depth: int  # The number of tournament layers.
-  params: Optional[Mapping[str, Mapping[str, Any]]] = None
-  baserate: float = 0.5  # Prior probability P(w) that a text is watermarked.
+  # watermarking_depth: int  # The number of tournament layers.
+  # params: Optional[Mapping[str, Mapping[str, Any]]] = None
+  # baserate: float = 0.5  # Prior probability P(w) that a text is watermarked.
 
-  @property
-  def score_type(self) -> ScoreType:
-    return ScoreType.POSTERIOR
-
-  def l2_loss(self) -> jnp.ndarray:
-    return self.likelihood_model_watermarked.l2_loss()
-
-  def setup(self):
+  def __init__(self, watermarking_depth: int, params: Optional[Mapping[str, Any]] = None, baserate: float = 0.5):
     """Initializes the model parameters."""
+    super().__init__()
+    self.watermarking_depth = watermarking_depth
+    self.params = params
+    self.baserate = baserate
 
     def _fetch_params():
       return {"params:": self.params["params"]["likelihood_model_watermarked"]}
@@ -415,13 +409,20 @@ class BayesianDetectorModule(nn.Module):
         params=_fetch_params() if self.params is not None else None,
     )
     self.likelihood_model_unwatermarked = LikelihoodModelUnwatermarked()
-    self.prior = self.param("prior", lambda *x: self.baserate, (1,))
+    self.prior = nn.Parameter(torch.tensor(baserate), requires_grad=False)
 
-  def __call__(
+  @property
+  def score_type(self) -> ScoreType:
+    return ScoreType.POSTERIOR
+
+  def l2_loss(self) -> torch.Tensor:
+    return self.likelihood_model_watermarked.l2_loss()
+
+  def forward(
       self,
-      g_values: jnp.ndarray,
-      mask: jnp.ndarray,
-  ) -> jnp.ndarray:
+      g_values: torch.Tensor,
+      mask: torch.Tensor,
+  ) -> torch.Tensor:
     """Computes the watermarked posterior P(watermarked|g_values).
 
     Args:
@@ -437,37 +438,37 @@ class BayesianDetectorModule(nn.Module):
     likelihoods_watermarked = self.likelihood_model_watermarked(g_values)
     likelihoods_unwatermarked = self.likelihood_model_unwatermarked(g_values)
     return _compute_posterior(
-        likelihoods_watermarked, likelihoods_unwatermarked, mask, self.prior
+        likelihoods_watermarked, likelihoods_unwatermarked, mask, self.prior.item()
     )
 
   def score(
       self,
-      g_values: Union[jnp.ndarray, Sequence[jnp.ndarray]],
-      mask: jnp.ndarray,
-  ) -> jnp.ndarray:
+      g_values: Union[torch.Tensor, Sequence[torch.Tensor]],
+      mask: torch.Tensor,
+  ) -> torch.Tensor:
     if self.params is None:
       raise ValueError("params must be set before calling score")
-    return self.apply(self.params, g_values, mask, method=self.__call__)
+    return self.forward(g_values, mask)
 
 
-def xentropy_loss(y: jnp.ndarray, y_pred: jnp.ndarray) -> jnp.ndarray:
+def xentropy_loss(y: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
   """Calculates cross entropy loss."""
-  y_pred = jnp.clip(y_pred, 1e-5, 1 - 1e-5)
-  return -jnp.mean((y * jnp.log(y_pred) + (1 - y) * jnp.log(1 - y_pred)))
+  y_pred = torch.clamp(y_pred, min=1e-5, max=1 - 1e-5)
+  return torch.mean(-(y * torch.log(y_pred) + (1 - y) * torch.log(1 - y_pred)))
 
 
 def loss_fn(
     params: Mapping[str, Any],
     detector_inputs: Any,
-    w_true: jnp.ndarray,
+    w_true: torch.Tensor,
     l2_batch_weight: float,
     detector_module: BayesianDetectorModule,
-) -> jnp.ndarray:
+) -> torch.Tensor:
   """Calculates loss for a batch of data given parameters."""
-  w_pred = detector_module.apply(
-      params, *detector_inputs, method=detector_module.__call__
-  )
-  unweighted_l2 = detector_module.apply(params, method=detector_module.l2_loss)
+  w_pred = detector_module(*detector_inputs)
+
+  unweighted_l2 = detector_module.l2_loss()
+
   l2_loss = l2_batch_weight * unweighted_l2
   return xentropy_loss(w_true, w_pred) + l2_loss
 
@@ -475,15 +476,17 @@ def loss_fn(
 def tpr_at_fpr(
     params: Mapping[str, Any],
     detector_inputs: Any,
-    w_true: jnp.ndarray,
+    w_true: torch.Tensor,
     minibatch_size,
     detector_module: BayesianDetectorModule,
     target_fpr: float = 0.01,
-) -> jnp.ndarray:
+) -> torch.Tensor:
   """Calculates TPR at FPR=target_fpr."""
   positive_idxs = w_true == 1
   negative_idxs = w_true == 0
-  inds = jnp.arange(0, len(detector_inputs[0]), minibatch_size)
+
+  inds = torch.arange(0, len(detector_inputs[0]), minibatch_size)
+
   w_preds = []
   for start in inds:
     end = start + minibatch_size
@@ -491,15 +494,17 @@ def tpr_at_fpr(
         detector_inputs[0][start:end],
         detector_inputs[1][start:end],
     )
-    w_pred = detector_module.apply(
-        params, *detector_inputs_, method=detector_module.__call__
-    )
+    w_pred = detector_module(*detector_inputs_)
     w_preds.append(w_pred)
-  w_pred = jnp.concatenate(w_preds, axis=0)
+
+  w_pred = torch.cat(w_preds, dim=0)
+
   positive_scores = w_pred[positive_idxs]
   negative_scores = w_pred[negative_idxs]
-  fpr_threshold = jnp.percentile(negative_scores, 100 - target_fpr * 100)
-  return jnp.mean(positive_scores >= fpr_threshold)
+  
+  fpr_threshold = torch.quantile(negative_scores, 1 - target_fpr)
+
+  return torch.mean(positive_scores >= fpr_threshold)
 
 
 @enum.unique
@@ -509,25 +514,6 @@ class ValidationMetric(enum.Enum):
   TPR_AT_FPR = "tpr_at_fpr"
   CROSS_ENTROPY = "cross_entropy"
 
-
-def train(
-    *,
-    detector_module: BayesianDetectorModule,
-    g_values: jnp.ndarray,
-    mask: jnp.ndarray,
-    watermarked: jnp.ndarray,
-    epochs: int = 250,
-    learning_rate: float = 1e-3,
-    minibatch_size: int = 64,
-    seed: int = 0,
-    l2_weight: float = 0.0,
-    shuffle: bool = True,
-    g_values_val: Optional[jnp.ndarray] = None,
-    mask_val: Optional[jnp.ndarray] = None,
-    watermarked_val: Optional[jnp.ndarray] = None,
-    verbose: bool = False,
-    validation_metric: ValidationMetric = ValidationMetric.TPR_AT_FPR,
-) -> tuple[Mapping[int, Mapping[str, PyTree]], float]:
   """Trains a Bayesian detector model.
 
   Args:
@@ -563,16 +549,37 @@ def train(
         'loss', 'val_loss', and 'params', respectively.
       min_val_loss: Minimum validation loss achieved during training.
   """
-  minibatch_inds = jnp.arange(0, len(g_values), minibatch_size)
+
+def train(
+    *,
+    detector_module: BayesianDetectorModule,
+    g_values: torch.Tensor,
+    mask: torch.Tensor,
+    watermarked: torch.Tensor,
+    epochs: int = 250,
+    learning_rate: float = 1e-3,
+    minibatch_size: int = 64,
+    seed: int = 0,
+    l2_weight: float = 0.0,
+    shuffle: bool = True,
+    g_values_val: Optional[torch.Tensor] = None,
+    mask_val: Optional[torch.Tensor] = None,
+    watermarked_val: Optional[torch.Tensor] = None,
+    verbose: bool = False,
+    validation_metric: ValidationMetric = ValidationMetric.TPR_AT_FPR,
+) -> tuple[Mapping[int, Mapping[str, PyTree]], float]:
+
+  minibatch_inds = torch.arange(0, len(g_values), minibatch_size)
   minibatch_inds_val = None
   if g_values_val is not None:
-    minibatch_inds_val = jnp.arange(0, len(g_values_val), minibatch_size)
+    minibatch_inds_val = torch.arange(0, len(g_values_val), minibatch_size)
 
-  rng = jax.random.PRNGKey(seed)
-  param_rng, shuffle_rng = jax.random.split(rng)
+  torch.manual_seed(seed)
+
+  # param_rng, shuffle_rng = jax.random.split(rng)
 
   def coshuffle(*args):
-    return [jax.random.permutation(shuffle_rng, x) for x in args]
+    return [x[torch.randperm(x.size(0))] for x in args]
 
   if shuffle:
     g_values, mask, watermarked = coshuffle(g_values, mask, watermarked)
@@ -588,7 +595,7 @@ def train(
     )
     return -tpr_
 
-  n_minibatches = len(g_values) / minibatch_size
+  n_minibatches = len(g_values) // minibatch_size
   l2_batch_weight_train = l2_weight / n_minibatches
   l2_batch_weight_val = 0.0
   loss_fn_train = functools.partial(
@@ -596,32 +603,33 @@ def train(
       l2_batch_weight=l2_batch_weight_train,
       detector_module=detector_module,
   )
-  loss_fn_jitted_val = jax.jit(
-      functools.partial(
+
+  loss_fn_jitted_val = functools.partial(
           loss_fn,
           l2_batch_weight=l2_batch_weight_val,
           detector_module=detector_module,
-      )
   )
 
-  @jax.jit
-  def update(gvalues, masks, labels, params, opt_state):
+  def update(gvalues, masks, labels, params, optimizer):
     loss_fn_partialed = functools.partial(
         loss_fn_train,
         detector_inputs=(gvalues, masks),
         w_true=labels,
     )
-    loss, grads = jax.value_and_grad(loss_fn_partialed)(params)
-    updates, opt_state = optimizer.update(grads, opt_state)
-    params = optax.apply_updates(params, updates)
-    return loss, params, opt_state
 
-  def update_with_minibatches(gvalues, masks, labels, inds, params, opt_state):
+    loss = loss_fn_partialed(params)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return loss.item(), params, optimizer
+
+  def update_with_minibatches(gvalues, masks, labels, inds, params, optimizer):
     """Update params iff opt_state is not None and always returns the loss."""
     losses = []
     for start in inds:
       end = start + minibatch_size
-      loss, params, opt_state = update(
+      loss, params, optimizer = update(
           gvalues[start:end],
           masks[start:end],
           labels[start:end],
@@ -629,8 +637,8 @@ def train(
           opt_state,
       )
       losses.append(loss)
-    loss = jnp.mean(jnp.array(losses))
-    return loss, params, opt_state
+    loss = torch.mean(torch.tensor(losses))
+    return loss.item(), params, optimizer
 
   def validate_with_minibatches(gvalues, masks, labels, inds, params):
     """Update params iff opt_state is not None and always returns the loss."""
@@ -642,8 +650,8 @@ def train(
           detector_inputs=(gvalues[start:end], masks[start:end]),
           w_true=labels[start:end],
       )
-      losses.append(loss)
-    return jnp.mean(jnp.array(losses))
+      losses.append(loss.item())
+    return torch.mean(torch.tensor(losses)).item()
 
   def update_fn(opt_state, params):
     """Updates the model parameters and returns the loss."""
@@ -667,15 +675,15 @@ def train(
 
   params = detector_module.params
   if params is None:
-    params = detector_module.init(param_rng, g_values[:1], mask[:1])
+    params = detector_module.init_params(seed=seed)
 
-  optimizer = optax.adam(learning_rate=learning_rate)
-  opt_state = optimizer.init(params)
+  optimizer = optim.Adam(params.values(), lr=learning_rate)
 
   history = {}
   epochs_completed = 0
+
   while epochs_completed < epochs:
-    opt_state, params, loss, val_loss = update_fn(opt_state, params)
+    optimizer, params, loss, val_loss = update_fn(optimizer, params)
     epochs_completed += 1
 
     history[epochs_completed] = {
@@ -683,6 +691,7 @@ def train(
         "val_loss": val_loss,
         "params": params["params"],
     }
+
     if verbose:
       if val_loss is not None:
         print(
@@ -690,14 +699,17 @@ def train(
         )
       else:
         print(f"Epoch {epochs_completed}: loss {loss} (train)")
-  detector_module.params = params
+
   val_loss = np.squeeze(
       np.array([history[epoch]["val_loss"] for epoch in range(1, epochs + 1)])
   )
   best_val_epoch = np.argmin(val_loss) + 1
   min_val_loss = val_loss[best_val_epoch - 1]
+
   print(f"Best val Epoch: {best_val_epoch}, min_val_loss: {min_val_loss}")
+ 
   detector_module.params = {"params": history[best_val_epoch]["params"]}
+
   return history, min_val_loss
 
 
@@ -721,7 +733,7 @@ class BayesianDetector:
     self.logits_processor = logits_processor
     self.tokenizer = tokenizer
 
-  def score(self, outputs: jnp.ndarray) -> jnp.ndarray:
+  def score(self, outputs: torch.Tensor) -> torch.Tensor:
     """Score the model output for possibility of being watermarked.
 
     Score is within [0, 1] where 0 is not watermarked and 1 is watermarked.
@@ -754,7 +766,7 @@ class BayesianDetector:
     )
     # g values shape [batch_size, output_len - (ngram_len - 1), depth]
     return self.detector_module.score(
-        g_values.cpu().numpy(), combined_mask.cpu().numpy()
+        g_values=g_values, mask=combined_mask
     )
 
   @classmethod
@@ -877,21 +889,13 @@ class BayesianDetector:
     uwm_labels_cv = torch.zeros((uwm_masks_cv.shape[0],), dtype=torch.bool)
 
     # Concat pos and negatives data together.
-    train_g_values = (
-        torch.cat((wm_g_values_train, uwm_g_values_train), dim=0).cpu().numpy()
-    )
-    train_labels = (
-        torch.cat((wm_labels_train, uwm_labels_train), axis=0).cpu().numpy()
-    )
-    train_masks = (
-        torch.cat((wm_masks_train, uwm_masks_train), axis=0).cpu().numpy()
-    )
+    train_g_values = torch.cat((wm_g_values_train, uwm_g_values_train), dim=0)
+    train_labels = torch.cat((wm_labels_train, uwm_labels_train), axis=0)
+    train_masks = torch.cat((wm_masks_train, uwm_masks_train), axis=0)
 
-    cv_g_values = (
-        torch.cat((wm_g_values_cv, uwm_g_values_cv), axis=0).cpu().numpy()
-    )
-    cv_labels = torch.cat((wm_labels_cv, uwm_labels_cv), axis=0).cpu().numpy()
-    cv_masks = torch.cat((wm_masks_cv, uwm_masks_cv), axis=0).cpu().numpy()
+    cv_g_values = torch.cat((wm_g_values_cv, uwm_g_values_cv), axis=0)
+    cv_labels = torch.cat((wm_labels_cv, uwm_labels_cv), axis=0)
+    cv_masks = torch.cat((wm_masks_cv, uwm_masks_cv), axis=0)
 
     # Free up GPU memory.
     del (
@@ -906,13 +910,13 @@ class BayesianDetector:
     torch.cuda.empty_cache()
 
     # Shuffle data.
-    train_g_values = jnp.squeeze(train_g_values)
-    train_labels = jnp.squeeze(train_labels)
-    train_masks = jnp.squeeze(train_masks)
+    train_g_values = train_g_values.squeeze()
+    train_labels = train_labels.squeeze()
+    train_masks = train_masks.squeeze()
 
-    cv_g_values = jnp.squeeze(cv_g_values)
-    cv_labels = jnp.squeeze(cv_labels)
-    cv_masks = jnp.squeeze(cv_masks)
+    cv_g_values = cv_g_values.squeeze()
+    cv_labels = cv_labels.squeeze()
+    cv_masks = cv_masks.squeeze()
 
     shuffled_idx = list(range(train_g_values.shape[0]))
     shuffled_idx = np.array(shuffled_idx)
@@ -941,17 +945,17 @@ class BayesianDetector:
   def train_best_detector_given_g_values(
       cls,
       *,
-      train_g_values: jnp.ndarray,
-      train_masks: jnp.ndarray,
-      train_labels: jnp.ndarray,
-      cv_g_values: jnp.ndarray,
-      cv_masks: jnp.ndarray,
-      cv_labels: jnp.ndarray,
+      train_g_values: torch.Tensor,
+      train_masks: torch.Tensor,
+      train_labels: torch.Tensor,
+      cv_g_values: torch.Tensor,
+      cv_masks: torch.Tensor,
+      cv_labels: torch.Tensor,
       logits_processor: logits_processing.SynthIDLogitsProcessor,
       tokenizer: Any,
       n_epochs: int = 50,
       learning_rate: float = 2.1e-2,
-      l2_weights: np.ndarray = np.logspace(-3, -2, num=4),
+      l2_weights: np.ndarray = np.logspace(-3, -2, steps=4),
       verbose: bool = False,
   ) -> tuple["BayesianDetector", float]:
     """Train best detector given g_values, mask and labels."""
@@ -962,6 +966,7 @@ class BayesianDetector:
       detector_module = BayesianDetectorModule(
           watermarking_depth=len(logits_processor.keys),
       )
+
       _, min_val_loss = train(
           detector_module=detector_module,
           g_values=train_g_values,
@@ -971,10 +976,11 @@ class BayesianDetector:
           mask_val=cv_masks,
           watermarked_val=cv_labels,
           learning_rate=learning_rate,
-          l2_weight=l2_weight,
+          l2_weight=l2_weight.item(),
           epochs=n_epochs,
           verbose=verbose,
       )
+
       val_losses.append(min_val_loss)
       if min_val_loss < lowest_loss:
         lowest_loss = min_val_loss
@@ -986,8 +992,8 @@ class BayesianDetector:
   def train_best_detector(
       cls,
       *,
-      tokenized_wm_outputs: Union[Sequence[np.ndarray], np.ndarray],
-      tokenized_uwm_outputs: Union[Sequence[np.ndarray], np.ndarray],
+      tokenized_wm_outputs: Union[Sequence[torch.Tensor], torch.Tensor],
+      tokenized_uwm_outputs: Union[Sequence[torch.Tensor], torch.Tensor],
       logits_processor: logits_processing.SynthIDLogitsProcessor,
       tokenizer: Any,
       torch_device: torch.device,
@@ -997,7 +1003,7 @@ class BayesianDetector:
       max_padded_length: int = 2300,
       n_epochs: int = 50,
       learning_rate: float = 2.1e-2,
-      l2_weights: np.ndarray = np.logspace(-3, -2, num=4),
+      l2_weights: torch.Tensor = torch.logspace(-3, -2, steps=4),
       verbose: bool = False,
   ) -> tuple["BayesianDetector", float]:
     """Construct, train and return the best detector based on wm and uwm data.
@@ -1051,6 +1057,13 @@ class BayesianDetector:
         neg_truncation_length=neg_truncation_length,
         max_padded_length=max_padded_length,
     )
+
+    train_g_values = torch.tensor(train_g_values, device=torch_device)
+    train_masks = torch.tensor(train_masks, device=torch_device)
+    train_labels = torch.tensor(train_labels, device=torch_device)
+    cv_g_values = torch.tensor(cv_g_values, device=torch_device)
+    cv_masks = torch.tensor(cv_masks, device=torch_device)
+    cv_labels = torch.tensor(cv_labels, device=torch_device)
 
     return cls.train_best_detector_given_g_values(
         train_g_values=train_g_values,
