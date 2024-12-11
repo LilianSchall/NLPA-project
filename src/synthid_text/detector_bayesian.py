@@ -26,6 +26,8 @@ import numpy as np
 from sklearn import model_selection
 import torch
 import tqdm
+from torch import optim
+from torch.nn import init
 
 from src.synthid_text import logits_processing
 
@@ -82,7 +84,7 @@ def filter_and_truncate(
 
 
 def process_outputs_for_training(
-    all_outputs: Sequence[torch.Tensor],
+    all_outputs: Sequence[torch.LongTensor],
     logits_processor: logits_processing.SynthIDLogitsProcessor,
     tokenizer: Any,
     *,
@@ -411,6 +413,20 @@ class BayesianDetectorModule(nn.Module):
     self.likelihood_model_unwatermarked = LikelihoodModelUnwatermarked()
     self.prior = nn.Parameter(torch.tensor(baserate), requires_grad=False)
 
+    if self.params is not None:
+        self.load_state_dict(self.params["params"])
+    else:
+        self._initialize_parameters()
+
+  def _initialize_parameters(self):
+      """Initialize the parameters (equivalent to `init` in Flax)."""
+      # Example: We initialize layers using Xavier for Linear layers
+      for m in self.modules():
+          if isinstance(m, nn.Linear):  # Check if it's a Linear layer
+              init.xavier_uniform_(m.weight)  # Xavier initialization for weights
+              if m.bias is not None:
+                  init.zeros_(m.bias)  # Initialize bias to zero
+
   @property
   def score_type(self) -> ScoreType:
     return ScoreType.POSTERIOR
@@ -567,7 +583,7 @@ def train(
     watermarked_val: Optional[torch.Tensor] = None,
     verbose: bool = False,
     validation_metric: ValidationMetric = ValidationMetric.TPR_AT_FPR,
-) -> tuple[Mapping[int, Mapping[str, PyTree]], float]:
+) -> tuple[Mapping[int, Mapping[str, Any]], float]:
 
   minibatch_inds = torch.arange(0, len(g_values), minibatch_size)
   minibatch_inds_val = None
@@ -634,7 +650,7 @@ def train(
           masks[start:end],
           labels[start:end],
           params,
-          opt_state,
+          optimizer,
       )
       losses.append(loss)
     loss = torch.mean(torch.tensor(losses))
@@ -675,7 +691,8 @@ def train(
 
   params = detector_module.params
   if params is None:
-    params = detector_module.init_params(seed=seed)
+      detector_module._initialize_parameters()
+      params = detector_module.params
 
   optimizer = optim.Adam(params.values(), lr=learning_rate)
 
@@ -733,7 +750,7 @@ class BayesianDetector:
     self.logits_processor = logits_processor
     self.tokenizer = tokenizer
 
-  def score(self, outputs: torch.Tensor) -> torch.Tensor:
+  def score(self, outputs: torch.LongTensor) -> torch.Tensor:
     """Score the model output for possibility of being watermarked.
 
     Score is within [0, 1] where 0 is not watermarked and 1 is watermarked.
@@ -782,7 +799,7 @@ class BayesianDetector:
       pos_truncation_length: Optional[int] = 200,
       neg_truncation_length: Optional[int] = 100,
       max_padded_length: int = 2300,
-  ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Process raw models outputs into inputs we can train.
 
     Args:
@@ -955,7 +972,7 @@ class BayesianDetector:
       tokenizer: Any,
       n_epochs: int = 50,
       learning_rate: float = 2.1e-2,
-      l2_weights: np.ndarray = np.logspace(-3, -2, steps=4),
+      l2_weights: torch.Tensor = torch.logspace(-3, -2, steps=4),
       verbose: bool = False,
   ) -> tuple["BayesianDetector", float]:
     """Train best detector given g_values, mask and labels."""
