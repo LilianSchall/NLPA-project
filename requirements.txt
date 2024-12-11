@@ -1,5 +1,9 @@
 torch
-transformers
+transformers==4.43.3
 numpy
 tqdm
 ai2-olmo
+immutabledict
+datasets
+jupyter
+accelerate
