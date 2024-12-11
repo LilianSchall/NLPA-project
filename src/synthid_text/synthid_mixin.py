@@ -415,3 +415,8 @@ class SynthIDGemmaForCausalLM(
     SynthIDSparseTopKMixin, transformers.GemmaForCausalLM
 ):
   pass
+
+class SynthIDLlamaForCausalLM(
+    SynthIDSparseTopKMixin, transformers.LlamaForCausalLM
+):
+    pass
