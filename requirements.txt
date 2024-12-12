@@ -3,10 +3,14 @@ transformers==4.43.3
 numpy
 tqdm
 ai2-olmo
-immutabledict
+huggingface_hub
 datasets
-jupyter
 accelerate
+jupyter
+tensorflow
 jax
 jaxtyping
 flax
+immutabledict
+scikit-learn
+matplotlib
