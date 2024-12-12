@@ -14,3 +14,4 @@ flax
 immutabledict
 scikit-learn
 matplotlib
+seaborn
